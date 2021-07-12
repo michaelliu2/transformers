@@ -120,7 +120,7 @@ _deps = [
     "parameterized",
     "protobuf",
     "psutil",
-    "pyyaml",
+    "pyyaml>=5.1",
     "pydantic",
     "pytest",
     "pytest-sugar",
