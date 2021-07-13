@@ -244,6 +244,16 @@ class BaseModelOutputWithPastAndCrossAttentions(ModelOutput):
 
 
 @dataclass
+class BaseModelOutputWithSwapAttentions(BaseModelOutputWithPastAndCrossAttentions):
+    swap_attentions: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
+
+
+@dataclass
+class BaseModelOutputWithPoolingAndSwapAttentions(BaseModelOutputWithPoolingAndCrossAttentions):
+    swap_attentions: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
+
+
+@dataclass
 class Seq2SeqModelOutput(ModelOutput):
     """
     Base class for model encoder's outputs that also contains : pre-computed hidden states that can speed up sequential

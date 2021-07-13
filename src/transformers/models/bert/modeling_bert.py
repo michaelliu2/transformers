@@ -27,6 +27,7 @@ import torch.utils.checkpoint
 from packaging import version
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+import torch.nn.functional as F
 
 from ...activations import ACT2FN
 from ...file_utils import (
@@ -39,6 +40,8 @@ from ...file_utils import (
 from ...modeling_outputs import (
     BaseModelOutputWithPastAndCrossAttentions,
     BaseModelOutputWithPoolingAndCrossAttentions,
+    BaseModelOutputWithSwapAttentions,
+    BaseModelOutputWithPoolingAndSwapAttentions,
     CausalLMOutputWithCrossAttentions,
     MaskedLMOutput,
     MultipleChoiceModelOutput,
@@ -250,7 +253,7 @@ class NystromAttention(nn.Module):
         return V
 
     def extra_repr(self):
-        return f'num_landmarks={self.num_landmarks}, seq_len={self.seq_len}'
+        return f'num_landmarks={self.landmarks}, seq_len={self.seq_len}'
 
 
 class NewAttention(nn.Module):
@@ -268,6 +271,20 @@ class NewAttention(nn.Module):
             head_dim=self.attention_head_size,
             heads=self.num_attention_heads,
         )
+
+    @staticmethod
+    def _copy_linear_layer(from_layer, to_layer):
+        to_layer.weight.data = from_layer.weight.data
+        to_layer.bias.data = from_layer.bias.data
+
+    def copy_attention_params(self, attn_layer: nn.Module):
+        """
+        takes self_attention_layer and copies weighst over to
+        this new attention layer
+        """
+        self._copy_linear_layer(attn_layer.query, self.query)
+        self._copy_linear_layer(attn_layer.key, self.key)
+        self._copy_linear_layer(attn_layer.value, self.value)
 
     def reverse_reshape_layer(self, tensor: torch.Tensor, batch_size: int, seq_length: int):
         """
@@ -692,10 +709,6 @@ class BertLayer(nn.Module):
 
 class BertEncoder(nn.Module):
     def __init__(self, config):
-        config.swap_attention_layers = [11]
-        # Rght now swap_attention_layers functionality assumes
-        # there's no cross_attention
-        assert not config.add_cross_attention
         super().__init__()
         self.config = config
         self.layer = nn.ModuleList([BertLayer(config, idx) for idx in range(config.num_hidden_layers)])
@@ -773,7 +786,6 @@ class BertEncoder(nn.Module):
                 all_swap_attentions = all_swap_attentions + ((layer_outputs[1], layer_outputs[2]), )
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
-
         if not return_dict:
             return tuple(
                 v
@@ -787,12 +799,13 @@ class BertEncoder(nn.Module):
                 ]
                 if v is not None
             )
-        return BaseModelOutputWithPastAndCrossAttentions(
+        return BaseModelOutputWithSwapAttentions(
             last_hidden_state=hidden_states,
             past_key_values=next_decoder_cache,
             hidden_states=all_hidden_states,
             attentions=all_self_attentions,
             cross_attentions=all_cross_attentions,
+            swap_attentions=all_swap_attentions,
         )
 
 
@@ -1176,17 +1189,17 @@ class BertModel(BertPreTrainedModel):
         )
         sequence_output = encoder_outputs[0]
         pooled_output = self.pooler(sequence_output) if self.pooler is not None else None
-
         if not return_dict:
             return (sequence_output, pooled_output) + encoder_outputs[1:]
 
-        return BaseModelOutputWithPoolingAndCrossAttentions(
+        return BaseModelOutputWithPoolingAndSwapAttentions(
             last_hidden_state=sequence_output,
             pooler_output=pooled_output,
             past_key_values=encoder_outputs.past_key_values,
             hidden_states=encoder_outputs.hidden_states,
             attentions=encoder_outputs.attentions,
             cross_attentions=encoder_outputs.cross_attentions,
+            swap_attentions=encoder_outputs.swap_attentions,
         )
 
 
@@ -1655,14 +1668,36 @@ class BertForNextSentencePrediction(BertPreTrainedModel):
 )
 class BertForSequenceClassification(BertPreTrainedModel):
     def __init__(self, config):
-        #config.output_attentions = True
+        # Rght now swap_attention_layers functionality assumes
+        # there's no cross_attention
+        if config.swap_attention_layers:
+            assert not config.add_cross_attention
+
         super().__init__(config)
+        self.swap_attention_layers = config.swap_attention_layers
+        self.swap_attention_loss_weight = config.swap_attention_loss_weight
+        self.swap_attention_copy_params = config.swap_attention_copy_params
+        self.freeze_bert = config.freeze_bert
+
         self.num_labels = config.num_labels
         self.config = config
         print(self.config)
         self.bert = BertModel(config)
-        for param in self.bert.parameters():
-            param.requires_grad = False
+        if self.freeze_bert:
+            for param in self.bert.parameters():
+                param.requires_grad = False
+
+        # Copy saved params to new attention
+        if self.swap_attention_copy_params:
+            for idx in self.swap_attention_layers:
+                attn_layer = self.bert.encoder.layer[idx].attention.self
+                attn_layer.new_attention.copy_attention_params(attn_layer)
+
+        # unfreeze new attention layers
+        for idx in self.swap_attention_layers:
+            for param in self.bert.encoder.layer[idx].attention.self.new_attention.parameters():
+                param.requires_grad = True
+
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         self.classifier = nn.Linear(config.hidden_size, config.num_labels)
 
@@ -1709,7 +1744,6 @@ class BertForSequenceClassification(BertPreTrainedModel):
         )
 
         pooled_output = outputs[1]
-
         pooled_output = self.dropout(pooled_output)
         logits = self.classifier(pooled_output)
 
@@ -1735,6 +1769,11 @@ class BertForSequenceClassification(BertPreTrainedModel):
             elif self.config.problem_type == "multi_label_classification":
                 loss_fct = BCEWithLogitsLoss()
                 loss = loss_fct(logits, labels)
+        if self.swap_attention_layers:
+            # NOTE we assume return_dict=True
+            for new_attention, old_attention in outputs.swap_attentions:
+                loss += self.swap_attention_loss_weight * F.mse_loss(new_attention, old_attention)
+
         if not return_dict:
             output = (logits,) + outputs[2:]
             return ((loss,) + output) if loss is not None else output
