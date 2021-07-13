@@ -163,6 +163,155 @@ def load_tf_weights_in_bert(model, config, tf_checkpoint_path):
         pointer.data = torch.from_numpy(array)
     return model
 
+class NystromAttention(nn.Module):
+    """
+    Nystrom Attention
+    Example:
+        N, S, H, D = 5, 2048, 8, 64
+        att = NystromAttention(seq_len=S, heads=H, head_dim=D)
+        Q = torch.randn(N, H, S, D)
+        Q = torch.randn(N, H, S, D)
+        K = torch.randn(N, H, S, D)
+        V = torch.randn(N, H, S, D)
+        mask = torch.ones(N, S)
+        out = att(Q, K, V, mask)
+    """
+    def __init__(
+        self,
+        seq_len: int = 512,
+        head_dim: int = 64,
+        heads: int = 8,
+        landmarks: int = 32,
+    ):
+        """
+        head_dim: the dimension of an individual head
+        """
+        super().__init__()
+
+        self.seq_len = seq_len
+        self.head_dim = head_dim
+        self.heads = heads
+
+        self.landmarks = landmarks
+
+    def forward(self, Q, K, V, mask):
+        """
+        Q, K, V : shape (N, num_heads, seq_len, head_dim)
+        mask : shape (N, 1, seq_len, 1)
+        """
+        assert self.heads == Q.shape[1] == K.shape[1] == V.shape[1]
+        assert self.seq_len == Q.shape[2] == K.shape[2] == V.shape[2] == mask.shape[2]
+        assert self.head_dim == Q.shape[3] == K.shape[3] == V.shape[3]
+
+        Q = Q * mask / math.sqrt(math.sqrt(self.head_dim))
+        K = K * mask / math.sqrt(math.sqrt(self.head_dim))
+
+        if self.landmarks == self.seq_len:
+            attn = torch.nn.functional.softmax(
+                torch.matmul(Q, K.transpose(-1, -2))
+                - 1e9 * (1 - mask.transpose(-1, -2)),
+                dim=-1)
+            X = torch.matmul(attn, V)
+        else:
+            Q_landmarks = Q.reshape(-1, self.heads, self.landmarks,
+                                    self.seq_len // self.landmarks,
+                                    self.head_dim).mean(dim=-2)
+            K_landmarks = K.reshape(-1, self.heads, self.landmarks,
+                                    self.seq_len // self.landmarks,
+                                    self.head_dim).mean(dim=-2)
+            kernel_1 = torch.nn.functional.softmax(
+                torch.matmul(Q, K_landmarks.transpose(-1, -2)),
+                dim=-1
+            )
+            kernel_2 = torch.nn.functional.softmax(
+                torch.matmul(Q_landmarks, K_landmarks.transpose(-1, -2)),
+                dim=-1
+            )
+            kernel_3 = torch.nn.functional.softmax(
+                torch.matmul(Q_landmarks, K.transpose(-1, -2))
+                - 1e9 * (1 - mask.transpose(-1, -2)),
+                dim=-1)
+            X = torch.matmul(
+                torch.matmul(kernel_1, self.iterative_inv(kernel_2)),
+                torch.matmul(kernel_3, V))
+
+        return X
+
+    def iterative_inv(self, mat, n_iter=6):
+        I = torch.eye(mat.size(-1), device=mat.device)
+        K = mat
+        V = 1 / (torch.max(torch.sum(torch.abs(K), dim=-2)) * torch.max(
+            torch.sum(torch.abs(K), dim=-1))) * K.transpose(-1, -2)
+        for _ in range(n_iter):
+            KV = torch.matmul(K, V)
+            V = torch.matmul(
+                0.25 * V, 13 * I -
+                torch.matmul(KV, 15 * I - torch.matmul(KV, 7 * I - KV)))
+        return V
+
+    def extra_repr(self):
+        return f'num_landmarks={self.num_landmarks}, seq_len={self.seq_len}'
+
+
+class NewAttention(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.num_attention_heads = config.num_attention_heads
+        self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
+        self.all_head_size = self.num_attention_heads * self.attention_head_size
+
+        self.query = nn.Linear(config.hidden_size, self.all_head_size)
+        self.key = nn.Linear(config.hidden_size, self.all_head_size)
+        self.value = nn.Linear(config.hidden_size, self.all_head_size)
+
+        self.nystrom_attention = NystromAttention(
+            head_dim=self.attention_head_size,
+            heads=self.num_attention_heads,
+        )
+
+    def reverse_reshape_layer(self, tensor: torch.Tensor, batch_size: int, seq_length: int):
+        """
+        transforms (N, num_heads, S, head_size) -> (N, S, num_heads * head_size)
+        """
+        return tensor.permute(0, 2, 1, 3).reshape(batch_size, seq_length, -1)
+
+    def reshape_layer(self, tensor: torch.Tensor, batch_size: int, seq_length: int):
+        """
+        transforms (N, S, num_heads * head_size) -> (N, num_heads, S, head_size)
+        """
+        return tensor.reshape(
+            batch_size,
+            seq_length,
+            self.num_attention_heads,
+            self.attention_head_size
+        ).permute(0, 2, 1, 3)
+
+    def forward(
+        self,
+        hidden_states,
+        attention_mask,
+        #head_mask=None,
+        #encoder_hidden_states=None,
+        #encoder_attention_mask=None,
+        #past_key_value=None,
+        #output_attentions=False,
+    ):
+        N, S, _ = hidden_states.shape
+        assert attention_mask.shape == (N, 1, 1, S)
+
+        query_layer = self.query(hidden_states)
+        key_layer = self.key(hidden_states)
+        value_layer = self.value(hidden_states)
+
+        context_layer = self.nystrom_attention(
+            self.reshape_layer(query_layer, N, S),
+            self.reshape_layer(key_layer, N, S),
+            self.reshape_layer(value_layer, N, S),
+            attention_mask.permute(0, 1, 3, 2)
+        )
+
+        return self.reverse_reshape_layer(context_layer, N, S)
+
 
 class BertEmbeddings(nn.Module):
     """Construct the embeddings from word, position and token_type embeddings."""
@@ -225,14 +374,21 @@ class BertEmbeddings(nn.Module):
 
 
 class BertSelfAttention(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, idx: int = None):
         super().__init__()
         if config.hidden_size % config.num_attention_heads != 0 and not hasattr(config, "embedding_size"):
             raise ValueError(
                 f"The hidden size ({config.hidden_size}) is not a multiple of the number of attention "
                 f"heads ({config.num_attention_heads})"
             )
-
+        if config.swap_attention_layers and idx in config.swap_attention_layers:
+            self.swap_attentions = True
+        else:
+            self.swap_attentions = False
+        if self.swap_attentions:
+            self.new_attention = NewAttention(config)
+        else:
+            self.new_attention = None
         self.num_attention_heads = config.num_attention_heads
         self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
         self.all_head_size = self.num_attention_heads * self.attention_head_size
@@ -342,7 +498,17 @@ class BertSelfAttention(nn.Module):
         new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
         context_layer = context_layer.view(*new_context_layer_shape)
 
-        outputs = (context_layer, attention_probs) if output_attentions else (context_layer,)
+        if self.swap_attentions:
+            # NOTE we don't account for the dropout layer above....
+            teacher_context_layer = context_layer.detach()
+            context_layer = self.new_attention(
+                hidden_states, attention_mask,
+            )
+            outputs = (context_layer, context_layer, teacher_context_layer)
+        elif output_attentions:
+            outputs = (context_layer, attention_probs)
+        else:
+            outputs = (context_layer,)
 
         if self.is_decoder:
             outputs = outputs + (past_key_value,)
@@ -364,9 +530,9 @@ class BertSelfOutput(nn.Module):
 
 
 class BertAttention(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, idx: int = None):
         super().__init__()
-        self.self = BertSelfAttention(config)
+        self.self = BertSelfAttention(config, idx)
         self.output = BertSelfOutput(config)
         self.pruned_heads = set()
 
@@ -442,16 +608,16 @@ class BertOutput(nn.Module):
 
 
 class BertLayer(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, idx: int = None):
         super().__init__()
         self.chunk_size_feed_forward = config.chunk_size_feed_forward
         self.seq_len_dim = 1
-        self.attention = BertAttention(config)
+        self.attention = BertAttention(config, idx)
         self.is_decoder = config.is_decoder
         self.add_cross_attention = config.add_cross_attention
         if self.add_cross_attention:
             assert self.is_decoder, f"{self} should be used as a decoder model if cross attention is added"
-            self.crossattention = BertAttention(config)
+            self.crossattention = BertAttention(config, idx)
         self.intermediate = BertIntermediate(config)
         self.output = BertOutput(config)
 
@@ -526,9 +692,13 @@ class BertLayer(nn.Module):
 
 class BertEncoder(nn.Module):
     def __init__(self, config):
+        config.swap_attention_layers = [11]
+        # Rght now swap_attention_layers functionality assumes
+        # there's no cross_attention
+        assert not config.add_cross_attention
         super().__init__()
         self.config = config
-        self.layer = nn.ModuleList([BertLayer(config) for _ in range(config.num_hidden_layers)])
+        self.layer = nn.ModuleList([BertLayer(config, idx) for idx in range(config.num_hidden_layers)])
 
     def forward(
         self,
@@ -546,6 +716,7 @@ class BertEncoder(nn.Module):
         all_hidden_states = () if output_hidden_states else None
         all_self_attentions = () if output_attentions else None
         all_cross_attentions = () if output_attentions and self.config.add_cross_attention else None
+        all_swap_attentions = () if self.config.swap_attention_layers else None
 
         next_decoder_cache = () if use_cache else None
         for i, layer_module in enumerate(self.layer):
@@ -596,7 +767,10 @@ class BertEncoder(nn.Module):
                 all_self_attentions = all_self_attentions + (layer_outputs[1],)
                 if self.config.add_cross_attention:
                     all_cross_attentions = all_cross_attentions + (layer_outputs[2],)
-
+            if self.config.swap_attention_layers and i in self.config.swap_attention_layers:
+                # layer_outputs[1] is context_layer
+                # layer_outputs[2] is old_context_layer (detached)
+                all_swap_attentions = all_swap_attentions + ((layer_outputs[1], layer_outputs[2]), )
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
 
@@ -609,6 +783,7 @@ class BertEncoder(nn.Module):
                     all_hidden_states,
                     all_self_attentions,
                     all_cross_attentions,
+                    all_swap_attentions,
                 ]
                 if v is not None
             )
@@ -856,7 +1031,6 @@ class BertModel(BertPreTrainedModel):
     def __init__(self, config, add_pooling_layer=True):
         super().__init__(config)
         self.config = config
-
         self.embeddings = BertEmbeddings(config)
         self.encoder = BertEncoder(config)
 
@@ -1481,11 +1655,14 @@ class BertForNextSentencePrediction(BertPreTrainedModel):
 )
 class BertForSequenceClassification(BertPreTrainedModel):
     def __init__(self, config):
+        #config.output_attentions = True
         super().__init__(config)
         self.num_labels = config.num_labels
         self.config = config
-
+        print(self.config)
         self.bert = BertModel(config)
+        for param in self.bert.parameters():
+            param.requires_grad = False
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         self.classifier = nn.Linear(config.hidden_size, config.num_labels)
 
