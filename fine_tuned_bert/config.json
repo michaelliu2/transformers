@@ -3,9 +3,10 @@
   "architectures": [
     "BertForSequenceClassification"
   ],
-  "swap_attention_layers": [7, 8, 9, 10, 11],
-  "swap_attention_loss_weight": 1.5,
-  "swap_attention_copy_params": false,
+  "swap_attention_layers": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+  "swap_attention_loss_weight": 0.0,
+  "swap_attention_copy_params": true,
+  "swap_attention_loss_only": true,
   "freeze_bert": true,
   "attention_probs_dropout_prob": 0.1,
   "gradient_checkpointing": false,

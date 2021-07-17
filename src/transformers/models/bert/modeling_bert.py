@@ -406,6 +406,7 @@ class BertSelfAttention(nn.Module):
             self.new_attention = NewAttention(config)
         else:
             self.new_attention = None
+        self.swap_attention_loss_only = config.swap_attention_loss_only
         self.num_attention_heads = config.num_attention_heads
         self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
         self.all_head_size = self.num_attention_heads * self.attention_head_size
@@ -521,7 +522,11 @@ class BertSelfAttention(nn.Module):
             context_layer = self.new_attention(
                 hidden_states, attention_mask,
             )
-            outputs = (context_layer, context_layer, teacher_context_layer)
+            if self.swap_attention_loss_only and self.training:
+                # pass the teacher attention through the next layer
+                outputs = (teacher_context_layer, context_layer, teacher_context_layer)
+            else:
+                outputs = (context_layer, context_layer, teacher_context_layer)
         elif output_attentions:
             outputs = (context_layer, attention_probs)
         else:
@@ -1677,6 +1682,7 @@ class BertForSequenceClassification(BertPreTrainedModel):
         self.swap_attention_layers = config.swap_attention_layers
         self.swap_attention_loss_weight = config.swap_attention_loss_weight
         self.swap_attention_copy_params = config.swap_attention_copy_params
+        self.swap_attention_loss_only = config.swap_attention_loss_only
         self.freeze_bert = config.freeze_bert
 
         self.num_labels = config.num_labels
@@ -1771,6 +1777,9 @@ class BertForSequenceClassification(BertPreTrainedModel):
                 loss = loss_fct(logits, labels)
         if self.swap_attention_layers:
             # NOTE we assume return_dict=True
+            if self.swap_attention_loss_only:
+                del loss
+                loss = 0
             for new_attention, old_attention in outputs.swap_attentions:
                 loss += self.swap_attention_loss_weight * F.mse_loss(new_attention, old_attention)
 
